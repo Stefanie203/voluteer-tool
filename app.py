@@ -12,6 +12,10 @@ st.caption("上传报名表 → 自动统计学时 → 生成符合规范的 Exc
 # ==================== 侧边栏配置（简化） ====================
 with st.sidebar:
     st.header("⚙️ 配置")
+    
+    # 新增：周数输入框
+    week_num = st.text_input("当前是第几周？（填入数字，如 2）", value="1")
+    
     st.info("单次活动学时固定为 2 学时。系统将自动按 2、4、6、8... 的偶数进行分组。")
     
     st.subheader("地点归类映射")
@@ -24,12 +28,14 @@ with st.sidebar:
         if "=" in line:
             k, v = line.split("=", 1)
             location_map[k.strip()] = v.strip()
+    
+    # 新增：默认地点，防止出现“未知地点”
+    default_location = st.text_input("如果表格没有地点列，默认按此处理", value="图书馆")
 
 # ==================== 数据清洗函数 ====================
 def clean_name(name):
     """去除名字前的班级前缀，例如 大数据2401卜晨 -> 卜晨"""
     if pd.isna(name): return None
-    # 匹配规则：2-4个中文字符 + 4位数字（班级） + 剩下的是名字
     cleaned = re.sub(r'^[\u4e00-\u9fa5]{2,4}\d{4}', '', str(name)).strip()
     return cleaned if cleaned else str(name).strip()
 
@@ -47,15 +53,12 @@ if uploaded_file is not None:
     st.subheader("🔍 原始数据预览")
     st.dataframe(raw_df.head(10), use_container_width=True)
 
-    # 智能提取姓名和学号列
     st.subheader("🛠️ 数据智能提取")
     
-    # 尝试自动识别
     name_cols = [c for c in raw_df.columns if "姓名" in str(c) or "志愿者" in str(c)]
     id_cols = [c for c in raw_df.columns if "学号" in str(c) or str(c).startswith("Unnamed")]
     loc_col = next((c for c in raw_df.columns if "地点" in str(c) or "站" in str(c) or "图书馆" in str(c)), None)
 
-    # 如果自动识别失败，提供手动选择
     if not name_cols or not id_cols:
         st.warning("未能完美自动识别，请手动选择对应的列：")
         cols = list(raw_df.columns)
@@ -65,14 +68,11 @@ if uploaded_file is not None:
         name_cols = [name_col]
         id_cols = [id_col]
     
-    # 提取所有志愿者数据
     all_records = []
     for nc in name_cols:
-        # 尝试匹配对应的学号列
         prefix = str(nc).replace("姓名", "").replace("志愿者", "")
         ic = prefix + "学号"
         if ic not in raw_df.columns:
-            # 如果找不到，就取该列右侧的列
             idx = raw_df.columns.get_loc(nc)
             if idx + 1 < len(raw_df.columns):
                 ic = raw_df.columns[idx + 1]
@@ -83,7 +83,7 @@ if uploaded_file is not None:
             if loc_col and loc_col in raw_df.columns:
                 tmp["地点"] = raw_df[loc_col].ffill()
             else:
-                tmp["地点"] = "未知地点"
+                tmp["地点"] = default_location if default_location else "未知地点"
             tmp = tmp.dropna(subset=["姓名", "学号"])
             all_records.append(tmp)
     
@@ -98,13 +98,12 @@ if uploaded_file is not None:
     long_df["学号"] = long_df["学号"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     long_df["地点"] = long_df["地点"].astype(str).str.strip()
     
-    # 剔除空数据
     long_df = long_df[(long_df["姓名"] != "") & (long_df["学号"] != "")]
 
     st.subheader("✏️ 数据修正（可直接双击编辑，已去除班级前缀）")
     edited = st.data_editor(long_df, num_rows="dynamic", use_container_width=True)
 
-    # 自动映射地点（号站 -> 宿管站）
+    # 自动映射地点
     def map_location(loc):
         if "号站" in str(loc):
             return "宿管站"
@@ -113,9 +112,7 @@ if uploaded_file is not None:
     edited["活动分类"] = edited["地点"].apply(map_location)
 
     # ==================== 学时全自动统计 ====================
-    # 统计次数
     grouped = edited.groupby(["活动分类", "姓名", "学号"]).size().reset_index(name="次数")
-    # 学时 = 次数 * 2（固定）
     grouped["学时"] = grouped["次数"] * 2
 
     st.subheader("📊 统计结果")
@@ -131,8 +128,6 @@ if uploaded_file is not None:
     def make_excel(items):
         wb = Workbook()
         ws = wb.active
-
-        # 表头：姓名在前，学号在后
         ws["A1"], ws["B1"] = "姓名", "学号"
         yellow = PatternFill(patternType="solid", start_color="FFFF00", end_color="FFFF00")
         center = Alignment(horizontal="center", vertical="center")
@@ -141,21 +136,15 @@ if uploaded_file is not None:
             ws[c].alignment = center
             ws[c].fill = yellow
 
-        # 数据：宋体 12
         for i, it in enumerate(items, start=2):
             ws.cell(row=i, column=1, value=it["姓名"]).font = Font(name="宋体", size=12)
             ws.cell(row=i, column=2, value=it["学号"]).font = Font(name="宋体", size=12)
 
-        # 全边框
-        border = Border(
-            left=Side(style="thin"), right=Side(style="thin"),
-            top=Side(style="thin"), bottom=Side(style="thin")
-        )
+        border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
         for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=2):
             for cell in row:
                 cell.border = border
 
-        # 列宽，保证学号全显示
         ws.column_dimensions["A"].width = 15
         ws.column_dimensions["B"].width = 20
 
@@ -166,9 +155,11 @@ if uploaded_file is not None:
 
     st.subheader("📥 下载规范表格")
     for (cat, hrs), items in sorted(groups.items()):
-        fname = f"{cat}志愿活动{hrs}学时.xlsx"
+        # 核心修改：文件名加上“第X周”
+        week_prefix = f"第{week_num}周" if week_num else ""
+        fname = f"{week_prefix}{cat}志愿活动{hrs}学时.xlsx"
         
-        # 下载前预览
+        # 预览
         st.markdown(f"**预览：{fname}**")
         preview_df = pd.DataFrame(items)
         st.dataframe(preview_df, use_container_width=True, hide_index=True)
