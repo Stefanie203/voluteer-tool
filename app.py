@@ -2,21 +2,22 @@ import streamlit as st
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-from io import BytesIO, StringIO
+from io import BytesIO
+import re
 
-st.set_page_config(page_title="志愿学时统计工具", layout="wide")
+st.set_page_config(page_title="志愿学时自动统计工具", layout="wide")
 st.title("📊 志愿学时自动统计工具")
-st.caption("上传或粘贴报名表 → 自动统计学时 → 生成符合规范的 Excel")
+st.caption("上传报名表 → 自动统计学时 → 生成符合规范的 Excel")
 
-# ==================== 侧边栏配置 ====================
+# ==================== 侧边栏配置（简化） ====================
 with st.sidebar:
     st.header("⚙️ 配置")
-    hours_per_session = st.number_input("单次活动学时", min_value=1, value=2, step=1)
-
+    st.info("单次活动学时固定为 2 学时。系统将自动按 2、4、6、8... 的偶数进行分组。")
+    
     st.subheader("地点归类映射")
-    st.caption("格式：地点名=分类，每行一个")
-    default_mapping = "西苑一号站=宿管站\n中苑八号站=宿管站\n图书馆=图书馆"
-    mapping_text = st.text_area("映射关系", value=default_mapping, height=120)
+    st.caption("已内置自动规则：地名以“号站”结尾，自动归为“宿管站”。")
+    default_mapping = "图书馆=图书馆"
+    mapping_text = st.text_area("额外映射（可选，每行一个）", value=default_mapping, height=100)
 
     location_map = {}
     for line in mapping_text.strip().split("\n"):
@@ -24,96 +25,98 @@ with st.sidebar:
             k, v = line.split("=", 1)
             location_map[k.strip()] = v.strip()
 
+# ==================== 数据清洗函数 ====================
+def clean_name(name):
+    """去除名字前的班级前缀，例如 大数据2401卜晨 -> 卜晨"""
+    if pd.isna(name): return None
+    # 匹配规则：2-4个中文字符 + 4位数字（班级） + 剩下的是名字
+    cleaned = re.sub(r'^[\u4e00-\u9fa5]{2,4}\d{4}', '', str(name)).strip()
+    return cleaned if cleaned else str(name).strip()
+
 # ==================== 数据输入 ====================
-tab1, tab2 = st.tabs(["📁 上传文件", "📋 粘贴数据"])
+uploaded_file = st.file_uploader("上传 CSV / Excel 报名表", type=["csv", "xlsx", "xls"])
 
-raw_df = None
+if uploaded_file is not None:
+    try:
+        raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+        st.success(f"✅ 文件读取成功，共 {len(raw_df)} 行")
+    except Exception as e:
+        st.error(f"文件读取失败：{e}")
+        st.stop()
 
-with tab1:
-    f = st.file_uploader("上传 CSV / Excel", type=["csv", "xlsx", "xls"])
-    if f:
-        try:
-            raw_df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
-            st.success(f"读取到 {len(raw_df)} 行")
-        except Exception as e:
-            st.error(f"读取失败：{e}")
-
-with tab2:
-    text = st.text_area("从在线表格复制粘贴（Tab 分隔）", height=180)
-    if text.strip():
-        try:
-            raw_df = pd.read_csv(StringIO(text), sep="\t")
-            st.success(f"解析到 {len(raw_df)} 行")
-        except Exception as e:
-            st.error(f"解析失败：{e}")
-
-# ==================== 数据处理 ====================
-if raw_df is not None:
     st.subheader("🔍 原始数据预览")
-    st.dataframe(raw_df.head(20), use_container_width=True)
+    st.dataframe(raw_df.head(10), use_container_width=True)
 
-    def extract_long(df):
-        """自动把各种格式提取成长表：地点、姓名、学号"""
-        # 情况1：标准长表
-        if "姓名" in df.columns and "学号" in df.columns:
-            loc_candidates = ["地点", "活动地点", "位置", "站名", "站点"]
-            loc_col = next((c for c in df.columns if c in loc_candidates), None)
-            if loc_col:
-                res = df[[loc_col, "姓名", "学号"]].copy()
-                res.columns = ["地点", "姓名", "学号"]
-                res["地点"] = res["地点"].ffill()
-                return res.dropna(subset=["姓名", "学号"])
+    # 智能提取姓名和学号列
+    st.subheader("🛠️ 数据智能提取")
+    
+    # 尝试自动识别
+    name_cols = [c for c in raw_df.columns if "姓名" in str(c) or "志愿者" in str(c)]
+    id_cols = [c for c in raw_df.columns if "学号" in str(c) or str(c).startswith("Unnamed")]
+    loc_col = next((c for c in raw_df.columns if "地点" in str(c) or "站" in str(c) or "图书馆" in str(c)), None)
 
-        # 情况2：宽表（多个 姓名/学号 列对，如截图那种）
-        name_cols = [c for c in df.columns if "姓名" in str(c)]
-        if name_cols:
-            records = []
-            loc_col = next((c for c in df.columns if c in ["地点", "活动地点", "位置", "站名", "站点"]), None)
-            for nc in name_cols:
-                prefix = str(nc).replace("姓名", "")
-                ic = prefix + "学号"
-                if ic in df.columns:
-                    tmp = df[[nc, ic]].copy()
-                    tmp.columns = ["姓名", "学号"]
-                    tmp["地点"] = df[loc_col].ffill() if loc_col else "未知地点"
-                    tmp = tmp.dropna(subset=["姓名", "学号"])
-                    records.append(tmp)
-            if records:
-                return pd.concat(records, ignore_index=True)
-        return None
-
-    long_df = extract_long(raw_df)
-
-    # 自动识别失败时，手动选列
-    if long_df is None:
-        st.warning("未能自动识别格式，请手动选择对应列：")
+    # 如果自动识别失败，提供手动选择
+    if not name_cols or not id_cols:
+        st.warning("未能完美自动识别，请手动选择对应的列：")
         cols = list(raw_df.columns)
-        c1, c2, c3 = st.columns(3)
-        loc_col = c1.selectbox("地点列", cols, index=0)
-        name_col = c2.selectbox("姓名列", cols, index=min(1, len(cols) - 1))
-        id_col = c3.selectbox("学号列", cols, index=min(2, len(cols) - 1))
-        long_df = raw_df[[loc_col, name_col, id_col]].copy()
-        long_df.columns = ["地点", "姓名", "学号"]
-        long_df["地点"] = long_df["地点"].ffill()
-        long_df = long_df.dropna(subset=["姓名", "学号"])
-    else:
-        st.success(f"✅ 自动识别成功，共 {len(long_df)} 条记录")
+        c1, c2 = st.columns(2)
+        name_col = c1.selectbox("姓名列", cols, index=0)
+        id_col = c2.selectbox("学号列", cols, index=min(1, len(cols) - 1))
+        name_cols = [name_col]
+        id_cols = [id_col]
+    
+    # 提取所有志愿者数据
+    all_records = []
+    for nc in name_cols:
+        # 尝试匹配对应的学号列
+        prefix = str(nc).replace("姓名", "").replace("志愿者", "")
+        ic = prefix + "学号"
+        if ic not in raw_df.columns:
+            # 如果找不到，就取该列右侧的列
+            idx = raw_df.columns.get_loc(nc)
+            if idx + 1 < len(raw_df.columns):
+                ic = raw_df.columns[idx + 1]
+        
+        if ic in raw_df.columns:
+            tmp = raw_df[[nc, ic]].copy()
+            tmp.columns = ["姓名", "学号"]
+            if loc_col and loc_col in raw_df.columns:
+                tmp["地点"] = raw_df[loc_col].ffill()
+            else:
+                tmp["地点"] = "未知地点"
+            tmp = tmp.dropna(subset=["姓名", "学号"])
+            all_records.append(tmp)
+    
+    if not all_records:
+        st.error("未能提取到有效数据，请检查表格格式。")
+        st.stop()
+        
+    long_df = pd.concat(all_records, ignore_index=True)
 
     # 数据清洗
-    long_df["姓名"] = long_df["姓名"].astype(str).str.strip()
+    long_df["姓名"] = long_df["姓名"].apply(clean_name)
     long_df["学号"] = long_df["学号"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     long_df["地点"] = long_df["地点"].astype(str).str.strip()
+    
+    # 剔除空数据
     long_df = long_df[(long_df["姓名"] != "") & (long_df["学号"] != "")]
 
-    st.subheader("✏️ 数据修正（可直接双击编辑）")
+    st.subheader("✏️ 数据修正（可直接双击编辑，已去除班级前缀）")
     edited = st.data_editor(long_df, num_rows="dynamic", use_container_width=True)
 
-    # 映射活动分类
-    edited["活动分类"] = edited["地点"].apply(lambda x: location_map.get(x, x))
+    # 自动映射地点（号站 -> 宿管站）
+    def map_location(loc):
+        if "号站" in str(loc):
+            return "宿管站"
+        return location_map.get(str(loc), str(loc))
+    
+    edited["活动分类"] = edited["地点"].apply(map_location)
 
-    # 统计
+    # ==================== 学时全自动统计 ====================
+    # 统计次数
     grouped = edited.groupby(["活动分类", "姓名", "学号"]).size().reset_index(name="次数")
-    grouped["学时"] = grouped["次数"] * hours_per_session
+    # 学时 = 次数 * 2（固定）
+    grouped["学时"] = grouped["次数"] * 2
 
     st.subheader("📊 统计结果")
     st.dataframe(grouped, use_container_width=True)
@@ -164,10 +167,17 @@ if raw_df is not None:
     st.subheader("📥 下载规范表格")
     for (cat, hrs), items in sorted(groups.items()):
         fname = f"{cat}志愿活动{hrs}学时.xlsx"
+        
+        # 下载前预览
+        st.markdown(f"**预览：{fname}**")
+        preview_df = pd.DataFrame(items)
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+        
         st.download_button(
-            label=f"下载：{fname}（{len(items)} 人）",
+            label=f"⬇️ 下载：{fname}（{len(items)} 人）",
             data=make_excel(items),
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"dl_{cat}_{hrs}"
         )
+        st.markdown("---")
